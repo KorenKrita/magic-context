@@ -111,6 +111,7 @@ function formatResult(
 			result.content,
 		].join("\n");
 	}
+
 	if (result.source === "note") {
 		const anchor =
 			result.anchorOrdinal !== null &&

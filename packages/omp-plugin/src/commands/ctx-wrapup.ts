@@ -60,10 +60,29 @@ export interface RegisterCtxWrapupDeps {
 		[modelKey: string]: number | undefined;
 	};
 	runPiHistorianForWrapup?: typeof runPiHistorian;
+	wrapupLeaseWaitTimeoutMs?: number;
+	resolveRuntimeDeps?: (ctx: { cwd: string }) => CtxWrapupRuntimeDeps;
 }
+
+export type CtxWrapupRuntimeDeps = Omit<
+	RegisterCtxWrapupDeps,
+	"resolveRuntimeDeps"
+>;
 
 const DEFAULT_MESSAGES_TO_KEEP = 20;
 const LEASE_WAIT_MS = 1_000;
+const MAX_WRAPUP_LEASE_WAIT_MS = 10 * 60 * 1_000;
+
+type LeaseAcquireResult =
+	| { ok: true; holderId: string }
+	| { ok: false; reason: "ownership_lost" | "timeout" };
+
+function resolveWrapupLeaseWaitTimeout(deps: CtxWrapupRuntimeDeps): number {
+	const configured = deps.wrapupLeaseWaitTimeoutMs ?? MAX_WRAPUP_LEASE_WAIT_MS;
+	return Number.isFinite(configured) && configured >= 0
+		? configured
+		: MAX_WRAPUP_LEASE_WAIT_MS;
+}
 
 export function parseWrapupArgs(
 	raw: string,
@@ -105,8 +124,9 @@ export function registerCtxWrapupCommand(
 				});
 				return;
 			}
+			const currentDeps = deps.resolveRuntimeDeps?.(ctx) ?? deps;
 
-			const sessionMeta = getOrCreateSessionMeta(deps.db, sessionId);
+			const sessionMeta = getOrCreateSessionMeta(currentDeps.db, sessionId);
 			if (sessionMeta.isSubagent) {
 				sendCtxStatusMessage(pi, {
 					title: "/ctx-wrapup",
@@ -116,7 +136,7 @@ export function registerCtxWrapupCommand(
 				return;
 			}
 
-			if (!deps.historianModel) {
+			if (!currentDeps.historianModel) {
 				sendCtxStatusMessage(pi, {
 					title: "/ctx-wrapup",
 					text: "## Magic Wrapup\n\n/ctx-wrapup is unavailable because `historian.model` is not configured.",
@@ -135,18 +155,13 @@ export function registerCtxWrapupCommand(
 				return;
 			}
 
-			let result: string;
-			try {
-				result = await runPiWrapup(
-					pi,
-					deps,
-					ctx,
-					sessionId,
-					parsed.messagesToKeep,
-				);
-			} catch (err) {
-				result = `## Magic Wrapup — Failed\n\n${err instanceof Error ? err.message : String(err)}`;
-			}
+			const result = await runPiWrapup(
+				pi,
+				currentDeps,
+				ctx,
+				sessionId,
+				parsed.messagesToKeep,
+			);
 			sendCtxStatusMessage(pi, {
 				title: "/ctx-wrapup",
 				text: result,
@@ -171,9 +186,6 @@ export async function runPiWrapup(
 	}
 	if (isPiRecompInFlight(sessionId)) {
 		return "## Magic Wrapup — Skipped\n\nA recomp or upgrade is already running for this session. Wait for it to finish, then try `/ctx-wrapup` again.";
-	}
-	if (!deps.historianModel) {
-		return "## Magic Wrapup — Failed\n\n`historian.model` is not configured.";
 	}
 
 	const provider = { readMessages: () => readPiSessionMessages(ctx) };
@@ -262,7 +274,7 @@ export async function runPiWrapup(
 			} catch (err) {
 				// A missed renewal is safe because the wrapup marker has a five-minute TTL.
 				console.warn(
-					`[magic-context][pi] /ctx-wrapup marker renewal failed for ${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
+					`[magic-context][omp] /ctx-wrapup marker renewal failed for ${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
 				);
 			}
 		}, 60_000);
@@ -346,24 +358,28 @@ export async function runPiWrapup(
 					level: "info",
 				});
 
-				const leaseHolder = await acquireCompartmentLeaseEventually(
+				const leaseResult = await acquireCompartmentLeaseEventually(
 					deps.db,
 					sessionId,
 					renewWrapupMarker,
+					resolveWrapupLeaseWaitTimeout(deps),
 				);
-				if (!leaseHolder) {
+				if (!leaseResult.ok) {
 					failure = ownershipLost
 						? `${ownershipLostReason}; wrapped up through message ${lastEnd}. Run /ctx-wrapup again to continue.`
-						: "Another Magic Context rebuild started while wrapup was waiting. Run /ctx-wrapup again to continue.";
+						: leaseResult.reason === "timeout"
+							? `Timed out waiting for another process to release the compartment-state lease; wrapped up through message ${lastEnd}. Run /ctx-wrapup again to continue.`
+							: "Another Magic Context rebuild started while wrapup was waiting. Run /ctx-wrapup again to continue.";
 					break;
 				}
+				const leaseHolder = leaseResult.holderId;
 				const leaseRenewal = setInterval(() => {
 					try {
 						renewCompartmentLease(deps.db, sessionId, leaseHolder);
 					} catch (err) {
 						// A missed renewal is safe because the compartment lease has a five-minute TTL.
 						console.warn(
-							`[magic-context][pi] /ctx-wrapup compartment lease renewal failed for ${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
+							`[magic-context][omp] /ctx-wrapup compartment lease renewal failed for ${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
 						);
 					}
 				}, COMPARTMENT_LEASE_RENEWAL_MS);
@@ -375,8 +391,9 @@ export async function runPiWrapup(
 						directory: ctx.cwd,
 						provider,
 						runner: deps.runner,
-						historianModel: deps.historianModel,
+						historianModel: deps.historianModel as string,
 						fallbackModels: deps.historianFallbacks,
+						fallbackModelId: modelKey,
 						historianChunkTokens: deps.historianChunkTokens,
 						boundarySnapshot: plan.snapshot,
 						refreshBoundarySnapshot: () =>
@@ -480,13 +497,20 @@ async function acquireCompartmentLeaseEventually(
 	renewWrapupMarker: (
 		updates: Parameters<typeof updateWrapupInProgress>[3],
 	) => boolean,
-): Promise<string | null> {
+	maxWaitMs: number,
+): Promise<LeaseAcquireResult> {
+	const waitStartedAt = Date.now();
+	const remainingMs = (): number =>
+		Math.max(0, waitStartedAt + maxWaitMs - Date.now());
 	for (;;) {
+		if (remainingMs() <= 0) return { ok: false, reason: "timeout" };
 		const holderId = crypto.randomUUID();
 		const lease = acquireCompartmentLease(db, sessionId, holderId);
-		if (lease) return holderId;
-		if (!renewWrapupMarker({})) return null;
-		await new Promise((resolve) => setTimeout(resolve, LEASE_WAIT_MS));
+		if (lease) return { ok: true, holderId };
+		if (!renewWrapupMarker({})) return { ok: false, reason: "ownership_lost" };
+		await new Promise((resolve) =>
+			setTimeout(resolve, Math.min(LEASE_WAIT_MS, remainingMs())),
+		);
 	}
 }
 
