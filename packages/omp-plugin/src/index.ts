@@ -93,8 +93,8 @@ import {
 import { registerCtxFlushCommand } from "./commands/ctx-flush";
 import { registerCtxRecompCommand } from "./commands/ctx-recomp";
 import { registerCtxSessionUpgradeCommand } from "./commands/ctx-session-upgrade";
-import { registerCtxWrapupCommand } from "./commands/ctx-wrapup";
 import { registerCtxStatusCommand } from "./commands/ctx-status";
+import { registerCtxWrapupCommand } from "./commands/ctx-wrapup";
 import { loadPiConfig } from "./config";
 import {
 	awaitInFlightHistorians,
@@ -143,6 +143,11 @@ import {
 } from "./system-prompt";
 import { withTimeout } from "./timeout";
 import { registerMagicContextTools } from "./tools";
+import {
+	registerTodoOverlay,
+	registerTodoStateLifecycle,
+	setTodoSnapshot,
+} from "./tools/todo-view-pi";
 
 const PREFIX = "[magic-context][omp]";
 
@@ -153,6 +158,11 @@ function resolveCurrentProject(ctx: { cwd: string }): {
 	const projectDir = ctx.cwd;
 	const projectIdentity = resolveProjectIdentityOrFallback(projectDir);
 	return { projectDir, projectIdentity };
+}
+
+export function signalPiDeferredCompactionMarkerDrain(sessionId: string): void {
+	signalPiDeferredHistoryRefresh(sessionId);
+	signalPiDeferredMaterialization(sessionId);
 }
 
 export function persistPiMessageEndModelMeta(args: {
@@ -533,8 +543,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	try {
 		const pendingPiMarkerSessions = getSessionsWithPendingPiMarker(db);
 		for (const sid of pendingPiMarkerSessions) {
-			signalPiDeferredHistoryRefresh(sid);
-			signalPiDeferredMaterialization(sid);
+			signalPiDeferredCompactionMarkerDrain(sid);
 		}
 		if (pendingPiMarkerSessions.length > 0) {
 			log(
@@ -598,63 +607,24 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	await ensureProjectRegisteredFromPiDirectory(projectDir, db);
 	info(`registered embedding config for project ${projectIdentity}`);
 
-	// Register the agent-facing tools. Reuses the same business logic
-	// the OpenCode plugin uses (insertMemory, unifiedSearch, addNote, …)
-	// via the shared cortexkit DB. Cross-harness memory sharing is automatic
-	// because both plugins resolve the same project identity for the same
-	// directory.
-	registerMagicContextTools(pi, {
-		db,
-		ensureProjectRegistered: ensureProjectRegisteredFromPiDirectory,
-		// Main extension entry never gets the dreamer-only ctx_memory
-		// surface — those actions are reserved for dreamer subagents
-		// loaded via subagent-entry.ts with the
-		// `--magic-context-dreamer-actions` flag.
-		allowDreamerActions: false,
-		// ALWAYS register ctx_memory in the main entry. Pi is a single REPL that
-		// can `/cd` between projects, but tool registration happens once at boot,
-		// so gating registration on the BOOT project's memory.enabled would
-		// mismatch the per-project prompt (which re-resolves memory.enabled each
-		// pass): start in a memory-off project and switch to a memory-on one and
-		// the tool would be absent while the prompt advertises it. The tool's
-		// own per-call guard (ctx-memory.ts, getProjectEmbeddingSnapshot) refuses
-		// when the CURRENT project has memory off, so always-register is correct.
-		// (The subagent entry still uses memoryToolEnabled to keep ctx_memory off
-		// the retrieval-only sidekick, a separate security concern.)
-		memoryToolEnabled: true,
-		protectedTags: config.protected_tags ?? 20,
-		// Smart notes (surface_condition) only work when dreamer is
-		// running — otherwise the note sits `pending` forever with no
-		// path to surface. Match the user's dreamer config flag.
-		dreamerEnabled: isDreamerRunnable(config),
-	});
-	info(
-		"registered tools: ctx_search, ctx_memory, ctx_note, ctx_expand, ctx_reduce",
-	);
+	type ResolvedPiProjectDeps = {
+		projectDir: string;
+		projectIdentity: string;
+		config: MagicContextConfig;
+		historianConfig: PiHistorianOptions | undefined;
+		autoSearchConfig: PiAutoSearchHandlerOptions;
+		contextOptions: PiContextHandlerOptions;
+		sidekickConfig: PiSidekickConfig | undefined;
+		dreamerConfig: DreamerConfig | undefined;
+		dreamerEnabled: boolean;
+	};
 
-	// Register the per-LLM-call transform pipeline. Tags eligible message
-	// parts via the shared Tagger and applies queued drops from
-	// `pending_ops` so /ctx-flush and ctx_reduce work against Pi sessions.
-	const historianConfig = resolveHistorianFromConfig(config);
-	if (historianConfig) {
-		historianConfig.onStatusChange = (ctx) => {
-			updateStatusLine(ctx, {
-				db,
-				projectIdentity: resolveCurrentProject(ctx).projectIdentity,
-			});
-		};
-	}
-	const autoSearchConfig = resolveAutoSearchFromConfig(config);
+	// Per-cwd runtime deps. Pi can switch projects mid-process (`/cd`,
+	// multi-root), while tools and slash commands are registered only once.
+	// Resolve all project-sensitive config through this memoized accessor so
+	// every invocation reads the active cwd's config instead of the launch cwd's.
+	const projectDepsByDir = new Map<string, ResolvedPiProjectDeps>();
 
-	// Per-cwd context-handler options. Pi can switch projects mid-process
-	// (`/cd`, multi-root); a switched-into checkout may carry its own
-	// .pi/magic-context.jsonc (protected_tags, thresholds, memory/key-files
-	// toggles, historian model). buildPiContextHandlerOptions resolves the
-	// options for a given config; resolveContextOptionsForProject memoizes by
-	// projectDir so the hot path (`pi.on("context")`, once per LLM call) does
-	// one config read per distinct project and reuses it thereafter. The launch
-	// cwd is pre-seeded with the already-loaded boot config.
-	const contextOptionsByDir = new Map<string, PiContextHandlerOptions>();
 	const buildContextOptions = (
 		cfg: MagicContextConfig,
 		hist: PiHistorianOptions | undefined,
@@ -710,60 +680,157 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			);
 		},
 	});
-	function resolveContextOptionsForProject(
+
+	function buildProjectDeps(
 		dir: string,
-	): PiContextHandlerOptions {
-		const cached = contextOptionsByDir.get(dir);
-		if (cached) return cached;
-		// A different checkout: re-resolve config + historian/auto-search from
-		// the new cwd. The launch dir is pre-seeded below so this branch only
-		// runs for genuine switches.
-		ensureConfigLocationsMigrated(dir);
-		const switchedConfig = loadPiConfig({ cwd: dir }).config;
-		const switchedHistorian = resolveHistorianFromConfig(switchedConfig);
-		if (switchedHistorian) {
-			switchedHistorian.onStatusChange = (ctx) => {
+		identity: string,
+		cfg: MagicContextConfig,
+	): ResolvedPiProjectDeps {
+		const hist = resolveHistorianFromConfig(cfg);
+		if (hist) {
+			hist.onStatusChange = (ctx) => {
 				updateStatusLine(ctx, {
 					db: database,
 					projectIdentity: resolveCurrentProject(ctx).projectIdentity,
 				});
 			};
 		}
-		const built = buildContextOptions(
-			switchedConfig,
-			switchedHistorian,
-			resolveAutoSearchFromConfig(switchedConfig),
-		);
-		contextOptionsByDir.set(dir, built);
+		const auto = resolveAutoSearchFromConfig(cfg);
+		return {
+			projectDir: dir,
+			projectIdentity: identity,
+			config: cfg,
+			historianConfig: hist,
+			autoSearchConfig: auto,
+			contextOptions: buildContextOptions(cfg, hist, auto),
+			sidekickConfig: resolveSidekickFromConfig(cfg),
+			dreamerConfig: resolveDreamerFromConfig(cfg),
+			dreamerEnabled: isDreamerRunnable(cfg),
+		};
+	}
+
+	function resolveProjectDepsForDir(
+		dir: string,
+		identityOverride?: string,
+	): ResolvedPiProjectDeps {
+		const cached = projectDepsByDir.get(dir);
+		if (cached) return cached;
+		ensureConfigLocationsMigrated(dir);
+		const switchedConfig = loadPiConfig({ cwd: dir }).config;
+		const switchedIdentity =
+			identityOverride ?? resolveProjectIdentityOrFallback(dir);
+		const built = buildProjectDeps(dir, switchedIdentity, switchedConfig);
+		projectDepsByDir.set(dir, built);
 		return built;
 	}
-	const bootContextOptions = buildContextOptions(
-		config,
-		historianConfig,
-		autoSearchConfig,
-	);
-	contextOptionsByDir.set(projectDir, bootContextOptions);
-	registerPiContextHandler(pi, bootContextOptions);
+
+	function resolveCurrentProjectDeps(ctx: {
+		cwd: string;
+	}): ResolvedPiProjectDeps {
+		const currentProject = resolveCurrentProject(ctx);
+		return resolveProjectDepsForDir(
+			currentProject.projectDir,
+			currentProject.projectIdentity,
+		);
+	}
+
+	function resolveContextOptionsForProject(
+		dir: string,
+	): PiContextHandlerOptions {
+		return resolveProjectDepsForDir(dir).contextOptions;
+	}
+
+	const bootProjectDeps = buildProjectDeps(projectDir, projectIdentity, config);
+	projectDepsByDir.set(projectDir, bootProjectDeps);
+	const todowriteEnabled = bootProjectDeps.config.todowrite.enabled !== false;
+	const todowriteOverlayEnabled =
+		todowriteEnabled && bootProjectDeps.config.todowrite.overlay !== false;
+
+	// Register the agent-facing tools. Reuses the same business logic
+	// the OpenCode plugin uses (insertMemory, unifiedSearch, addNote, …)
+	// via the shared cortexkit DB. Cross-harness memory sharing is automatic
+	// because both plugins resolve the same project identity for the same
+	// directory.
+	// Pi registers tools, commands, and widgets once at extension boot. Therefore
+	// `todowrite.enabled` follows the boot project's config: after `/cd` into a
+	// project with a different value, users need `/reload` or a Pi restart for the
+	// tool/command/overlay surface to change, matching Pi's registration lifecycle.
+	registerMagicContextTools(pi, {
+		db,
+		ensureProjectRegistered: ensureProjectRegisteredFromPiDirectory,
+		// Main extension entry never gets the dreamer-only ctx_memory
+		// surface — those actions are reserved for dreamer subagents
+		// loaded via subagent-entry.ts with the
+		// `--magic-context-dreamer-actions` flag.
+		allowDreamerActions: false,
+		// ALWAYS register ctx_memory in the main entry. Pi is a single REPL that
+		// can `/cd` between projects, but tool registration happens once at boot,
+		// so gating registration on the BOOT project's memory.enabled would
+		// mismatch the per-project prompt (which re-resolves memory.enabled each
+		// pass): start in a memory-off project and switch to a memory-on one and
+		// the tool would be absent while the prompt advertises it. The tool's
+		// own per-call guard (ctx-memory.ts, getProjectEmbeddingSnapshot) refuses
+		// when the CURRENT project has memory off, so always-register is correct.
+		// (The subagent entry still uses memoryToolEnabled to keep ctx_memory off
+		// the retrieval-only sidekick, a separate security concern.)
+		memoryToolEnabled: true,
+		protectedTags: config.protected_tags ?? 20,
+		resolveProtectedTags: (ctx) =>
+			resolveCurrentProjectDeps(ctx).config.protected_tags ?? 20,
+		// Smart notes (surface_condition) only work when dreamer is
+		// running — otherwise the note sits `pending` forever with no
+		// path to surface. Match the user's dreamer config flag.
+		dreamerEnabled: isDreamerRunnable(config),
+		resolveDreamerEnabled: (ctx) =>
+			resolveCurrentProjectDeps(ctx).dreamerEnabled,
+		todowriteEnabled,
+	});
 	info(
-		historianConfig
-			? `registered historian trigger (model=${historianConfig.model}, executeThreshold=${formatExecuteThresholdForLog(historianConfig.executeThresholdPercentage)})`
+		todowriteEnabled
+			? "registered tools: ctx_search, ctx_memory, ctx_note, ctx_expand, todowrite, ctx_reduce; registered /todos"
+			: "registered tools: ctx_search, ctx_memory, ctx_note, ctx_expand, ctx_reduce (todowrite disabled)",
+	);
+
+	const readLastTodoState = (sessionId: string) =>
+		getOrCreateSessionMeta(db, sessionId).lastTodoState;
+	if (todowriteEnabled) {
+		registerTodoStateLifecycle(pi, { readLastTodoState });
+	}
+	const todoOverlay = todowriteOverlayEnabled
+		? registerTodoOverlay(pi, {
+				readLastTodoState,
+			})
+		: undefined;
+	info(
+		todowriteOverlayEnabled
+			? "registered todowrite overlay"
+			: "registered todowrite overlay: DISABLED (todowrite.enabled=false or todowrite.overlay=false)",
+	);
+
+	// Register the per-LLM-call transform pipeline. Tags eligible message
+	// parts via the shared Tagger and applies queued drops from
+	// `pending_ops` so /ctx-flush and ctx_reduce work against Pi sessions.
+	registerPiContextHandler(pi, bootProjectDeps.contextOptions);
+	info(
+		bootProjectDeps.historianConfig
+			? `registered historian trigger (model=${bootProjectDeps.historianConfig.model}, executeThreshold=${formatExecuteThresholdForLog(bootProjectDeps.historianConfig.executeThresholdPercentage)})`
 			: "registered historian trigger: DISABLED (set historian.model in magic-context.jsonc)",
 	);
 	info(
-		autoSearchConfig.enabled
-			? `registered auto-search hint (threshold=${autoSearchConfig.scoreThreshold}, minChars=${autoSearchConfig.minPromptChars})`
+		bootProjectDeps.autoSearchConfig.enabled
+			? `registered auto-search hint (threshold=${bootProjectDeps.autoSearchConfig.scoreThreshold}, minChars=${bootProjectDeps.autoSearchConfig.minPromptChars})`
 			: "registered auto-search hint: DISABLED (memory.auto_search.enabled=false)",
 	);
 
-	// Register the /ctx-aug slash command. Sidekick config is read straight
-	// from `config.sidekick` — when disabled or missing a model, the command
-	// surfaces a "not configured" message instead of attempting to run.
-	const sidekickConfig: PiSidekickConfig | undefined =
-		resolveSidekickFromConfig(config);
-	registerCtxAugCommand(pi, sidekickConfig);
+	// Register /ctx-aug once, but resolve sidekick config from the active cwd
+	// every invocation so `/cd` follows the current project's model/language.
+	registerCtxAugCommand(
+		pi,
+		(ctx) => resolveCurrentProjectDeps(ctx).sidekickConfig,
+	);
 	info(
-		sidekickConfig
-			? `registered /ctx-aug (sidekick model=${sidekickConfig.model})`
+		bootProjectDeps.sidekickConfig
+			? `registered /ctx-aug (sidekick model=${bootProjectDeps.sidekickConfig.model})`
 			: "registered /ctx-aug (sidekick disabled — set sidekick.disable=false and sidekick.model in config)",
 	);
 
@@ -774,19 +841,42 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	// the behavior of OpenCode's command-handler.ts but use Pi-native
 	// surfaces (registerCommand + sendMessage) instead of OpenCode's
 	// command.execute.before hook.
+	const recompRunner = new PiSubagentRunner();
+	const wrapupRunner = new PiSubagentRunner();
+	const upgradeRunner = new PiSubagentRunner();
 	registerCtxStatusCommand(pi, {
 		db,
 		projectIdentity,
 		resolveProject: resolveCurrentProject,
-		protectedTags: config.protected_tags,
-		executeThresholdPercentage: config.execute_threshold_percentage,
-		historyBudgetPercentage: config.history_budget_percentage,
-		injectionBudgetTokens: config.memory?.injection_budget_tokens,
-		commitClusterTrigger: config.commit_cluster_trigger,
-		executeThresholdTokens: config.execute_threshold_tokens,
+		protectedTags: bootProjectDeps.config.protected_tags,
+		executeThresholdPercentage:
+			bootProjectDeps.config.execute_threshold_percentage,
+		historyBudgetPercentage: bootProjectDeps.config.history_budget_percentage,
+		injectionBudgetTokens:
+			bootProjectDeps.config.memory?.injection_budget_tokens,
+		commitClusterTrigger: bootProjectDeps.config.commit_cluster_trigger,
+		executeThresholdTokens: bootProjectDeps.config.execute_threshold_tokens,
 		dreamer: {
-			runnable: isDreamerRunnable(config),
-			scheduleSummary: summarizeDreamSchedule(config.dreamer),
+			runnable: bootProjectDeps.dreamerEnabled,
+			scheduleSummary: summarizeDreamSchedule(bootProjectDeps.config.dreamer),
+		},
+		resolveStatusDeps: (ctx) => {
+			const current = resolveCurrentProjectDeps(ctx);
+			return {
+				db,
+				projectIdentity: current.projectIdentity,
+				resolveProject: resolveCurrentProject,
+				protectedTags: current.config.protected_tags,
+				executeThresholdPercentage: current.config.execute_threshold_percentage,
+				historyBudgetPercentage: current.config.history_budget_percentage,
+				injectionBudgetTokens: current.config.memory?.injection_budget_tokens,
+				commitClusterTrigger: current.config.commit_cluster_trigger,
+				executeThresholdTokens: current.config.execute_threshold_tokens,
+				dreamer: {
+					runnable: current.dreamerEnabled,
+					scheduleSummary: summarizeDreamSchedule(current.config.dreamer),
+				},
+			};
 		},
 	});
 	info("registered /ctx-status");
@@ -801,36 +891,78 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	// avoids cross-cancellation. Same model + fallback chain as historian.
 	registerCtxRecompCommand(pi, {
 		db,
-		runner: new PiSubagentRunner(),
-		historianModel: historianConfig?.model,
+		runner: recompRunner,
+		historianModel: bootProjectDeps.historianConfig?.model,
 		historianChunkTokens: deriveHistorianChunkTokens(
-			resolveHistorianContextLimit(historianConfig?.model),
+			resolveHistorianContextLimit(bootProjectDeps.historianConfig?.model),
 		),
-		historianFallbacks: historianConfig?.fallbackModels,
-		historianTimeoutMs: config.historian_timeout_ms,
-		historianThinkingLevel: historianConfig?.thinkingLevel,
-		language: config.language,
-		memoryEnabled: config.memory.enabled,
-		autoPromote: config.memory.auto_promote,
+		historianFallbacks: bootProjectDeps.historianConfig?.fallbackModels,
+		historianTimeoutMs: bootProjectDeps.config.historian_timeout_ms,
+		historianThinkingLevel: bootProjectDeps.historianConfig?.thinkingLevel,
+		language: bootProjectDeps.config.language,
+		memoryEnabled: bootProjectDeps.config.memory.enabled,
+		autoPromote: bootProjectDeps.config.memory.auto_promote,
+		resolveRuntimeDeps: (ctx) => {
+			const current = resolveCurrentProjectDeps(ctx);
+			return {
+				db,
+				runner: recompRunner,
+				historianModel: current.historianConfig?.model,
+				historianChunkTokens: deriveHistorianChunkTokens(
+					resolveHistorianContextLimit(current.historianConfig?.model),
+				),
+				historianFallbacks: current.historianConfig?.fallbackModels,
+				historianTimeoutMs: current.config.historian_timeout_ms,
+				historianThinkingLevel: current.historianConfig?.thinkingLevel,
+				language: current.config.language,
+				memoryEnabled: current.config.memory.enabled,
+				autoPromote: current.config.memory.auto_promote,
+			};
+		},
 	});
 	info("registered /ctx-recomp");
 
 	registerCtxWrapupCommand(pi, {
 		db,
-		runner: new PiSubagentRunner(),
-		historianModel: historianConfig?.model,
+		runner: wrapupRunner,
+		historianModel: bootProjectDeps.historianConfig?.model,
 		historianChunkTokens: deriveHistorianChunkTokens(
-			resolveHistorianContextLimit(historianConfig?.model),
+			resolveHistorianContextLimit(bootProjectDeps.historianConfig?.model),
 		),
-		historianFallbacks: historianConfig?.fallbackModels,
-		historianTimeoutMs: config.historian_timeout_ms,
-		historianThinkingLevel: historianConfig?.thinkingLevel,
-		language: config.language,
-		memoryEnabled: config.memory.enabled,
-		autoPromote: config.memory.auto_promote,
-		userMemoriesEnabled: userMemoryCollectionEnabled(config.dreamer),
-		executeThresholdPercentage: config.execute_threshold_percentage,
-		executeThresholdTokens: config.execute_threshold_tokens,
+		historianFallbacks: bootProjectDeps.historianConfig?.fallbackModels,
+		historianTimeoutMs: bootProjectDeps.config.historian_timeout_ms,
+		historianThinkingLevel: bootProjectDeps.historianConfig?.thinkingLevel,
+		language: bootProjectDeps.config.language,
+		memoryEnabled: bootProjectDeps.config.memory.enabled,
+		autoPromote: bootProjectDeps.config.memory.auto_promote,
+		userMemoriesEnabled: userMemoryCollectionEnabled(
+			bootProjectDeps.config.dreamer,
+		),
+		executeThresholdPercentage:
+			bootProjectDeps.config.execute_threshold_percentage,
+		executeThresholdTokens: bootProjectDeps.config.execute_threshold_tokens,
+		resolveRuntimeDeps: (ctx) => {
+			const current = resolveCurrentProjectDeps(ctx);
+			return {
+				db,
+				runner: wrapupRunner,
+				historianModel: current.historianConfig?.model,
+				historianChunkTokens: deriveHistorianChunkTokens(
+					resolveHistorianContextLimit(current.historianConfig?.model),
+				),
+				historianFallbacks: current.historianConfig?.fallbackModels,
+				historianTimeoutMs: current.config.historian_timeout_ms,
+				historianThinkingLevel: current.historianConfig?.thinkingLevel,
+				language: current.config.language,
+				memoryEnabled: current.config.memory.enabled,
+				autoPromote: current.config.memory.auto_promote,
+				userMemoriesEnabled: userMemoryCollectionEnabled(
+					current.config.dreamer,
+				),
+				executeThresholdPercentage: current.config.execute_threshold_percentage,
+				executeThresholdTokens: current.config.execute_threshold_tokens,
+			};
+		},
 	});
 	info("registered /ctx-wrapup");
 
@@ -839,18 +971,40 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	// for the same isolation reasons as /ctx-recomp.
 	registerCtxSessionUpgradeCommand(pi, {
 		db,
-		runner: new PiSubagentRunner(),
-		historianModel: historianConfig?.model,
+		runner: upgradeRunner,
+		historianModel: bootProjectDeps.historianConfig?.model,
 		historianChunkTokens: deriveHistorianChunkTokens(
-			resolveHistorianContextLimit(historianConfig?.model),
+			resolveHistorianContextLimit(bootProjectDeps.historianConfig?.model),
 		),
-		historianFallbacks: historianConfig?.fallbackModels,
-		historianTimeoutMs: config.historian_timeout_ms,
-		historianThinkingLevel: historianConfig?.thinkingLevel,
-		language: config.language,
-		memoryEnabled: config.memory.enabled,
-		autoPromote: config.memory.auto_promote,
-		userMemoriesEnabled: userMemoryCollectionEnabled(config.dreamer),
+		historianFallbacks: bootProjectDeps.historianConfig?.fallbackModels,
+		historianTimeoutMs: bootProjectDeps.config.historian_timeout_ms,
+		historianThinkingLevel: bootProjectDeps.historianConfig?.thinkingLevel,
+		language: bootProjectDeps.config.language,
+		memoryEnabled: bootProjectDeps.config.memory.enabled,
+		autoPromote: bootProjectDeps.config.memory.auto_promote,
+		userMemoriesEnabled: userMemoryCollectionEnabled(
+			bootProjectDeps.config.dreamer,
+		),
+		resolveRuntimeDeps: (ctx) => {
+			const current = resolveCurrentProjectDeps(ctx);
+			return {
+				db,
+				runner: upgradeRunner,
+				historianModel: current.historianConfig?.model,
+				historianChunkTokens: deriveHistorianChunkTokens(
+					resolveHistorianContextLimit(current.historianConfig?.model),
+				),
+				historianFallbacks: current.historianConfig?.fallbackModels,
+				historianTimeoutMs: current.config.historian_timeout_ms,
+				historianThinkingLevel: current.historianConfig?.thinkingLevel,
+				language: current.config.language,
+				memoryEnabled: current.config.memory.enabled,
+				autoPromote: current.config.memory.auto_promote,
+				userMemoriesEnabled: userMemoryCollectionEnabled(
+					current.config.dreamer,
+				),
+			};
+		},
 	});
 	info("registered /ctx-session-upgrade");
 
@@ -859,7 +1013,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		projectDir,
 		projectIdentity,
 		resolveProject: resolveCurrentProject,
-		dreamerEnabled: isDreamerRunnable(config),
+		dreamerEnabled: bootProjectDeps.dreamerEnabled,
+		resolveDreamerEnabled: (ctx) =>
+			resolveCurrentProjectDeps(ctx).dreamerEnabled,
 		onProjectSeen: (identity) => seenDreamerProjectIdentities.add(identity),
 	});
 	info("registered /ctx-dream");
@@ -868,7 +1024,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		db,
 		projectDir,
 		projectIdentity,
-		memoryEnabled: config.memory.enabled,
+		memoryEnabled: bootProjectDeps.config.memory.enabled,
+		resolveMemoryEnabled: (ctx) =>
+			resolveCurrentProjectDeps(ctx).config.memory.enabled,
 		resolveProject: resolveCurrentProject,
 	});
 	info("registered /ctx-embed");
@@ -877,7 +1035,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	// disabled in config (default) this is a no-op. When enabled, the timer
 	// schedules dream runs based on config.dreamer.schedule and uses
 	// PiSubagentRunner to spawn child sessions for each task.
-	const dreamerConfig = resolveDreamerFromConfig(config);
+	const dreamerConfig = bootProjectDeps.dreamerConfig;
 	if (dreamerConfig) {
 		registerPiDreamerProject({
 			db,
@@ -888,16 +1046,16 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			// dreamer can do semantic dedup AND can write memory updates.
 			// Previously hardcoded to off/false, making most dreamer tasks
 			// useless on Pi.
-			embeddingConfig: config.embedding,
-			memoryEnabled: config.memory.enabled,
-			language: config.language,
-			gitCommitIndexing: config.memory.git_commit_indexing,
+			embeddingConfig: bootProjectDeps.config.embedding,
+			memoryEnabled: bootProjectDeps.config.memory.enabled,
+			language: bootProjectDeps.config.language,
+			gitCommitIndexing: bootProjectDeps.config.memory.git_commit_indexing,
 			onAdjunctsRefreshNeeded: signalPiSystemPromptRefreshForProject,
 		});
 		info(`registered dreamer (${summarizeDreamSchedule(dreamerConfig)})`);
 	} else {
 		info(
-			isDreamerRunnable(config)
+			bootProjectDeps.dreamerEnabled
 				? "registered dreamer: DISABLED (no dreamer config)"
 				: "registered dreamer: DISABLED (dreamer.disable=true or no dreamer config)",
 		);
@@ -959,7 +1117,12 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		}
 
 		try {
-			const currentProject = resolveCurrentProject(ctx);
+			const effectiveProjectDeps = resolveCurrentProjectDeps(ctx);
+			const currentProject = {
+				projectDir: effectiveProjectDeps.projectDir,
+				projectIdentity: effectiveProjectDeps.projectIdentity,
+			};
+			const effectiveConfig = effectiveProjectDeps.config;
 			seenDreamerProjectIdentities.add(currentProject.projectIdentity);
 
 			// Re-register the dreamer for the CURRENT project. The boot-time
@@ -970,21 +1133,12 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			// same identity+dir, and rebuilds against the new checkout when the
 			// directory changed (worktree/clone of the same repo).
 			//
-			// On a genuine switch we MUST re-resolve config from the new
-			// checkout's cwd — the boot `config`/`dreamerConfig` belong to the
-			// launch directory, and a switched-into project may carry its own
-			// .pi/magic-context.jsonc (different model/schedule, or its own
-			// `dreamer.disable`). Reusing the boot config would silently run the
-			// dreamer in the new checkout with the old project's settings.
-			const switchedProject = currentProject.projectDir !== projectDir;
-			if (switchedProject)
-				ensureConfigLocationsMigrated(currentProject.projectDir);
-			const effectiveConfig = switchedProject
-				? loadPiConfig({ cwd: currentProject.projectDir }).config
-				: config;
-			const effectiveDreamerConfig = switchedProject
-				? resolveDreamerFromConfig(effectiveConfig)
-				: dreamerConfig;
+			// All project-sensitive config comes from resolveCurrentProjectDeps(ctx),
+			// the same per-cwd accessor used by tools, commands, and the context
+			// pipeline. A switched-into project may carry its own config (different
+			// model/schedule, or its own `dreamer.disable`), so boot config must not
+			// leak into this registration.
+			const effectiveDreamerConfig = effectiveProjectDeps.dreamerConfig;
 			if (effectiveDreamerConfig) {
 				try {
 					registerPiDreamerProject({
@@ -994,17 +1148,17 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 						config: effectiveDreamerConfig,
 						embeddingConfig: effectiveConfig.embedding,
 						memoryEnabled: effectiveConfig.memory.enabled,
+						language: effectiveConfig.language,
 						gitCommitIndexing: effectiveConfig.memory.git_commit_indexing,
 						onAdjunctsRefreshNeeded: signalPiSystemPromptRefreshForProject,
 					});
 				} catch (err) {
 					warn("before_agent_start: registerPiDreamerProject threw:", err);
 				}
-			} else if (switchedProject) {
-				// The switched-into checkout DISABLES the dreamer. Any existing
-				// registration for this identity is pinned to the old checkout and
-				// still enabled — registerPiDreamerProject's disable early-return
-				// can't clean it up, so tear it down explicitly here.
+			} else {
+				// The current checkout disables the dreamer. Any existing registration
+				// for this identity may have been created while another checkout's
+				// config was active, so tear it down explicitly here.
 				try {
 					unregisterPiDreamerProject({
 						projectIdentity: currentProject.projectIdentity,
@@ -1040,14 +1194,14 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				// the durable pending marker in session_meta survives. On switch-BACK
 				// the marker would then sit undrained (the drain is signal-driven, and
 				// startup-only rehydration never re-fires). Re-signal here when this
-				// session has a durable pending marker so the next pass drains it.
+				// session has a durable pending marker so the next eligible materializing
+				// pass drains it, using the same deferred signal shape as startup.
 				//
 				// Gate on the same APIs the drain itself requires
 				// (sessionManager.appendCompaction + getBranch): when they're
-				// unavailable the drain skips-and-PRESERVES the signal, so
-				// re-signaling every turn would force materialization repeatedly
-				// with no way to make progress (a per-turn cache bust). Only re-arm
-				// when the marker can actually be applied.
+				// unavailable the drain skips-and-PRESERVES the signal, so re-signaling
+				// every turn would keep an undrainable signal armed. Only re-arm when the
+				// marker can actually be applied.
 				try {
 					const smForDrain = sm as {
 						appendCompaction?: unknown;
@@ -1057,8 +1211,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 						typeof smForDrain.appendCompaction === "function" &&
 						typeof smForDrain.getBranch === "function";
 					if (canDrain && getPendingPiCompactionMarkerState(db, sessionId)) {
-						signalPiDeferredHistoryRefresh(sessionId);
-						signalPiPendingMaterialization(sessionId);
+						signalPiDeferredCompactionMarkerDrain(sessionId);
 					}
 				} catch {
 					// Best-effort: a read failure must not block agent start.
@@ -1068,7 +1221,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				// compartments. Model-invisible (ctx.ui.notify), self-gating via the
 				// durable + per-process guards in the shared helper. Only when the
 				// historian can run (so /ctx-session-upgrade is actionable).
-				if (ctx.hasUI && historianConfig?.model) {
+				if (ctx.hasUI && effectiveProjectDeps.historianConfig?.model) {
 					void maybeSendUpgradeReminder(
 						{
 							client: null,
@@ -1099,7 +1252,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				return;
 			}
 			// OMP passes systemPrompt as string[]; join for compatibility with
-			// core helpers that expect a single string.
+			// the shared injection logic that operates on a single string.
 			const systemPromptText = Array.isArray(event.systemPrompt)
 				? event.systemPrompt.join("\n")
 				: (event.systemPrompt as unknown as string);
@@ -1131,9 +1284,6 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				? hasSystemPromptRefresh(sessionId)
 				: true; // first-pass-no-session: act as cache-busting (force fresh read)
 
-			const effectiveDreamerRunnable = switchedProject
-				? isDreamerRunnable(effectiveConfig)
-				: isDreamerRunnable(config);
 			const block = buildMagicContextBlock({
 				db,
 				cwd: currentProject.projectDir,
@@ -1142,7 +1292,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				includeGuidance: true,
 				protectedTags: effectiveConfig.protected_tags,
 				ctxReduceCallable: true,
-				dreamerEnabled: effectiveDreamerRunnable,
+				dreamerEnabled: effectiveProjectDeps.dreamerEnabled,
 				temporalAwarenessEnabled: effectiveConfig.temporal_awareness ?? false,
 				cavemanTextCompressionEnabled:
 					effectiveConfig.caveman_text_compression?.enabled === true,
@@ -1158,7 +1308,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				existingSystemPrompt: systemPromptText,
 			});
 
-			// Compose the final system prompt: base prompt from OMP + our
+			// Compose the final system prompt: base prompt from Pi + our
 			// magic-context block. We always run hash detection on the
 			// composed string so even sessions with no data block (e.g.
 			// memories disabled, no docs, no key files) still get
@@ -1325,6 +1475,10 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				const sessionMeta = Array.isArray(todos)
 					? getOrCreateSessionMeta(db, sessionId)
 					: null;
+				if (todowriteEnabled && Array.isArray(todos)) {
+					setTodoSnapshot(sessionId, todos);
+					todoOverlay?.update(sessionId);
+				}
 
 				// Synthetic-todowrite snapshot capture (Pi parity with
 				// OpenCode hook-handlers.ts:386-401). Persist normalized
@@ -1515,7 +1669,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				db,
 				sessionId,
 				message: event.message,
-				cacheTtlConfig: config.cache_ttl,
+				cacheTtlConfig: resolveCurrentProjectDeps(ctx).config.cache_ttl,
 			});
 			// Compute pressure with OpenCode-equivalent semantics: pull
 			// the assistant's `usage` field and use
@@ -1600,6 +1754,10 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 							if (!Array.isArray(todos)) continue;
 							const normalized = normalizeTodoStateJson(todos);
 							if (normalized === null) continue;
+							if (todowriteEnabled) {
+								setTodoSnapshot(sessionId, todos);
+								todoOverlay?.update(sessionId);
+							}
 							updateSessionMeta(db, sessionId, {
 								lastTodoState: normalized,
 							});

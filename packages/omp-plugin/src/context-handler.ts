@@ -9,7 +9,7 @@
  * PARITY.md for the deliberate mechanism-level divergences). Per pass it:
  *   1. Wraps the AgentMessage[] in a Transcript via `createPiTranscript`.
  *   2. Tags eligible parts with the shared `Tagger` and injects `§N§ `
- *      prefixes (unless the session is a subagent).
+ *      prefixes (unless the session has no ctx_reduce tool).
  *   3. Applies queued drops (`pending_ops`) + persisted tag statuses so
  *      cross-session drops survive.
  *   4. Prepares m[0]/m[1] history injection, trims the live tail to the
@@ -69,6 +69,7 @@ import {
 	getPendingPiCompactionMarkerState,
 	getTagsByNumbers,
 	hasPiFallbackToolOwnerTags,
+	isWrapupInProgress,
 	setSessionWorkMetrics,
 	updateSessionMeta,
 } from "@magic-context/core/features/magic-context/storage";
@@ -83,7 +84,7 @@ import {
 	getAutoSearchHintDecisions,
 	getNoteNudgeAnchors,
 	getOverflowState,
-	isWrapupInProgress,
+	type PendingPiCompactionMarker,
 	peekDeferredExecutePending,
 	pruneAutoSearchHintDecisions,
 	pruneNoteNudgeAnchors,
@@ -135,6 +136,7 @@ import {
 	setRawMessageProvider,
 } from "@magic-context/core/hooks/magic-context/read-session-chunk";
 import { invalidateTrueRawTokenCache } from "@magic-context/core/hooks/magic-context/read-session-true-raw-tokens";
+import { modelAcceptsEmptyContent } from "@magic-context/core/hooks/magic-context/sentinel";
 import {
 	buildEditSupersessionReclaim,
 	buildSupersessionReclaimOps,
@@ -152,6 +154,7 @@ import {
 	runAutoSearchHintForPi,
 } from "./auto-search-pi";
 import { clearPiEmbedSessionState } from "./commands/ctx-embed";
+import { sendCtxStatusMessage } from "./commands/pi-command-utils";
 import {
 	type ApplyDeferredPiCompactionMarkerDeps,
 	applyDeferredPiCompactionMarker,
@@ -244,12 +247,31 @@ function applyForwardPressureFloor(
 		: { percentage: trailingPercentage, inputTokens: trailingInputTokens };
 }
 
+let injectM0M1PiForRun = injectM0M1Pi;
+
 export const __test = {
 	FORWARD_PRESSURE_LIMIT_FACTOR,
 	adoptPiFallbackTags,
 	applyForwardPressureFloor,
 	buildEntryFingerprintMap,
 	buildPiToolOwnerMap,
+	setInFlightHistorianForTests(
+		sessionId: string,
+		promise: Promise<unknown>,
+	): () => void {
+		inFlightHistorian.set(sessionId, promise);
+		return () => {
+			if (inFlightHistorian.get(sessionId) === promise) {
+				inFlightHistorian.delete(sessionId);
+			}
+		};
+	},
+	setInjectM0M1PiForTests(fn: typeof injectM0M1Pi): () => void {
+		injectM0M1PiForRun = fn;
+		return () => {
+			injectM0M1PiForRun = injectM0M1Pi;
+		};
+	},
 };
 
 /**
@@ -1840,6 +1862,11 @@ export function registerPiContextHandler(
 
 			const sessionMeta = sessionMetaForUsage;
 			const modelKey = liveModelBySession.get(sessionId);
+			const providerId =
+				typeof ctx.model?.provider === "string"
+					? ctx.model.provider
+					: undefined;
+			const canUseEmptySentinels = modelAcceptsEmptyContent(providerId);
 			// Cold-start stable-limit fallback: if `getContextUsage()` hasn't
 			// reported a (sane) window yet (first pass after restart, before any
 			// response), read the model's window directly from `ctx.model`
@@ -1874,6 +1901,7 @@ export function registerPiContextHandler(
 					piUsage?.tokens,
 					usageContextLimit,
 				));
+			const realUsagePercentageBeforeEmergencyBump = usagePercentage;
 			// Emergency bump LAST so it floors recovery pressure without capping
 			// a higher live forward-pressure reading.
 			if (needsEmergencyBump) {
@@ -2082,19 +2110,16 @@ export function registerPiContextHandler(
 					}
 				}
 
-				// Disarm a stuck emergency-recovery flag. The flag is normally
-				// cleared by the historian publication path (onPublished →
-				// clearEmergencyRecovery). But if recovery was armed by an
-				// overflow on a session with NO eligible pre-tail history to
-				// compact, no historian will ever spawn (maybeFireHistorian's
-				// trigger needs eligible history), so onPublished never fires and
-				// the flag stays armed — bumping every later pass to 95% forever
-				// (abort loop), even after the user manually frees context. Clear
-				// it here when there's no in-flight historian AND no eligible
-				// history, mirroring OpenCode transform.ts:745. detectedContextLimit
-				// is left intact (authoritative model data).
+				// Disarm a stuck emergency-recovery flag only after real pressure has
+				// fallen below the force-materialization threshold. The flag must survive
+				// while the session is genuinely oversized; clearing it early would expose
+				// the next send to another overflow. Once the user has freed enough context,
+				// the emergency bump is stale and can stop forcing every pass to 95%. The
+				// detected context limit is left intact as authoritative model data.
 				if (
 					emergencyRecoveryArmed &&
+					realUsagePercentageBeforeEmergencyBump <
+						FORCE_MATERIALIZATION_PERCENTAGE &&
 					!inFlightHistorian.has(sessionId) &&
 					!hasEligiblePiCompartmentHistory(options.db, sessionId)
 				) {
@@ -2187,7 +2212,6 @@ export function registerPiContextHandler(
 				projectIdentity,
 				projectDirectory,
 				messages: event.messages,
-				isSubagent: sessionMeta.isSubagent,
 				smartDrops: options.smartDrops === true,
 				protectedTags: options.protectedTags ?? 20,
 				heuristics: options.heuristics,
@@ -2231,9 +2255,11 @@ export function registerPiContextHandler(
 						options.heuristics?.clearReasoningAge ??
 						DEFAULT_CLEAR_REASONING_AGE,
 				},
+				canUseEmptySentinels,
 				temporalAwareness: options.injection?.temporalAwareness === true,
 				appendCompaction: resolvePiAppendCompaction(ctx),
 				readBranchEntries: resolvePiReadBranchEntries(ctx),
+				isSubagent: sessionMeta.isSubagent,
 			});
 			const piDecisionSnapshotNewestAssistant =
 				branchEntries === null
@@ -2270,6 +2296,7 @@ export function registerPiContextHandler(
 			// fire-and-forget so we never block the LLM call on it.
 			if (options.historian) {
 				maybeFireHistorian({
+					pi,
 					ctx,
 					sessionId,
 					db: options.db,
@@ -2406,10 +2433,10 @@ export function registerPiContextHandler(
 			// a missing baseline is how Channel 1 stays off for subagents.
 			try {
 				const sessionMetaForCh1 = getOrCreateSessionMeta(options.db, sessionId);
-				// Gate on not being a subagent. Channel 1 nudges the agent to call
-				// ctx_reduce; subagents don't have the tool registered (session-scoped
-				// tools are disabled), so a baseline/nudge would point at a missing
-				// tool. A missing baseline is also how Channel 1 stays off.
+				// Gate on ctx_reduce being callable. Primary Pi sessions register the
+				// tool; subagents do not, so a baseline/nudge there would point at a
+				// missing session-scoped tool. A missing baseline is also how Channel 1
+				// stays off.
 				if (!sessionMetaForCh1.isSubagent) {
 					// Resolve through the SCHEDULER config (the real execute
 					// threshold), not options.historian — when historian is disabled
@@ -2745,10 +2772,18 @@ function startPiCompartmentLeaseRenewal(
 	holderId: string,
 ): ReturnType<typeof setInterval> {
 	return setInterval(() => {
-		if (!renewCompartmentLease(db, sessionId, holderId)) {
+		try {
+			if (!renewCompartmentLease(db, sessionId, holderId)) {
+				sessionLog(
+					sessionId,
+					"compartment lease renewal failed; publish will be skipped if holder is stale",
+				);
+			}
+		} catch (err) {
+			// A missed renewal is safe because the compartment lease has a five-minute TTL.
 			sessionLog(
 				sessionId,
-				"compartment lease renewal failed; publish will be skipped if holder is stale",
+				`compartment lease renewal threw; publish will be skipped if holder is stale (${err instanceof Error ? err.message : String(err)})`,
 			);
 		}
 	}, COMPARTMENT_LEASE_RENEWAL_MS);
@@ -2818,6 +2853,7 @@ function sendPiIgnoredNotification(
 }
 
 function spawnPiHistorianRun(args: {
+	pi: ExtensionAPI;
 	ctx: ExtensionContext;
 	sessionId: string;
 	db: ContextDatabase;
@@ -2827,8 +2863,10 @@ function spawnPiHistorianRun(args: {
 	boundarySnapshot: ProtectedTailBoundarySnapshot;
 	refreshBoundarySnapshot?: () => ProtectedTailBoundarySnapshot;
 	currentContextLimit: number;
+	fallbackModelId?: string;
 }): void {
 	const {
+		pi,
 		ctx,
 		sessionId,
 		db,
@@ -2838,6 +2876,7 @@ function spawnPiHistorianRun(args: {
 		boundarySnapshot,
 		refreshBoundarySnapshot,
 		currentContextLimit,
+		fallbackModelId,
 	} = args;
 	const holderId = crypto.randomUUID();
 	const runPromise = (async () => {
@@ -2849,14 +2888,15 @@ function spawnPiHistorianRun(args: {
 			);
 			return;
 		}
+		if (isWrapupInProgress(db, sessionId)) {
+			// Close the cross-process check/lease race: /ctx-wrapup may have published
+			// its marker after the first check but before this process won the lease.
+			sessionLog(sessionId, "historian skipped: /ctx-wrapup became active");
+			releaseCompartmentLease(db, sessionId, holderId);
+			return;
+		}
 		const renewal = startPiCompartmentLeaseRenewal(db, sessionId, holderId);
 		try {
-			if (isWrapupInProgress(db, sessionId)) {
-				// Close the cross-process check/lease race: /ctx-wrapup may have published
-				// its marker after the first check but before this process won the lease.
-				sessionLog(sessionId, "historian skipped: /ctx-wrapup became active");
-				return;
-			}
 			await runPiHistorian({
 				db,
 				sessionId,
@@ -2867,6 +2907,7 @@ function spawnPiHistorianRun(args: {
 				runner: historian.runner,
 				historianModel: historian.model,
 				fallbackModels: historian.fallbackModels,
+				fallbackModelId,
 				historianChunkTokens: historian.historianChunkTokens,
 				boundarySnapshot,
 				refreshBoundarySnapshot,
@@ -2879,6 +2920,20 @@ function spawnPiHistorianRun(args: {
 				userMemoriesEnabled: historian.userMemoriesEnabled,
 				language: historian.language,
 				compartmentLeaseHolderId: holderId,
+				notifyIssue: (text) => {
+					if (!isContextHandlerSessionActive(sessionId)) {
+						sessionLog(
+							sessionId,
+							"historian failure notice skipped after session context cleared",
+						);
+						return;
+					}
+					sendCtxStatusMessage(pi, {
+						title: "Magic Context",
+						text,
+						level: "warning",
+					});
+				},
 				onPublished: () => {
 					const sessionStillActive = isContextHandlerSessionActive(sessionId);
 					try {
@@ -2976,6 +3031,7 @@ function resolvePiReadBranchEntries(
  * agent turn continues regardless of historian outcome.
  */
 function maybeFireHistorian(args: {
+	pi: ExtensionAPI;
 	ctx: ExtensionContext;
 	sessionId: string;
 	db: ContextDatabase;
@@ -3027,7 +3083,7 @@ function maybeFireHistorian(args: {
 			usageContextLimit === undefined &&
 			isSaneLimit(ctx.model?.contextWindow ?? undefined)
 		) {
-			usageContextLimit = ctx.model!.contextWindow!;
+			usageContextLimit = ctx.model!.contextWindow ?? undefined;
 		}
 		// Apply the detected-overflow cap (authoritative real limit) just like the
 		// main pass — otherwise the trigger budget uses the wrong (larger) limit.
@@ -3181,6 +3237,7 @@ function maybeFireHistorian(args: {
 					`## Historian recovery\n\nHistorian previously failed ${failureState.failureCount} time(s), so Magic Context is retrying history comparting immediately after restart.`,
 				);
 				spawnPiHistorianRun({
+					pi: args.pi,
 					ctx,
 					sessionId,
 					db,
@@ -3190,6 +3247,7 @@ function maybeFireHistorian(args: {
 					boundarySnapshot,
 					refreshBoundarySnapshot: resolveRunnablePiBoundarySnapshot,
 					currentContextLimit: boundaryContextLimit,
+					fallbackModelId: modelKey,
 				});
 				return;
 			}
@@ -3266,6 +3324,7 @@ function maybeFireHistorian(args: {
 		// at session_shutdown — without that, `pi --print` mode would
 		// kill the historian subprocess mid-run when the parent exits.
 		spawnPiHistorianRun({
+			pi: args.pi,
 			ctx,
 			sessionId,
 			db,
@@ -3278,6 +3337,7 @@ function maybeFireHistorian(args: {
 			}),
 			refreshBoundarySnapshot: resolveRunnablePiBoundarySnapshot,
 			currentContextLimit: boundaryContextLimit,
+			fallbackModelId: modelKey,
 		});
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
@@ -3293,7 +3353,6 @@ interface RunPipelineArgs {
 	projectIdentity: string;
 	projectDirectory: string;
 	messages: Parameters<typeof createPiTranscript>[0];
-	isSubagent?: boolean;
 	/** Smart-drops (experimental, default off): also reclaim tool output that a
 	 *  later call supersedes, on top of the age-based auto-drop. Off → messages
 	 *  sent to the model are byte-identical to the age-based-only behavior. */
@@ -3303,6 +3362,7 @@ interface RunPipelineArgs {
 	heuristics?: {
 		caveman?: { enabled: boolean; minChars: number };
 	};
+	isSubagent?: boolean;
 	/** ceiling = contextLimit × executeThreshold% for the tiered emergency drop. */
 	emergencyCeilingTokens?: number;
 	/** Memory-injection config — when omitted, no <session-history> injection runs. */
@@ -3386,6 +3446,8 @@ interface RunPipelineArgs {
 	reasoningClearing?: {
 		clearReasoningAge: number;
 	};
+	/** True only when the active provider filters empty sentinel content safely. */
+	canUseEmptySentinels: boolean;
 	/**
 	 * Whether to inject temporal `<!-- +Xm -->` markers into user
 	 * messages with large gaps. Mirrors OpenCode's
@@ -3435,6 +3497,16 @@ interface RunPipelineResult {
 	postCommitEntryIdByRef: ReadonlyMap<object, string>;
 }
 
+function pendingPiMarkerCoveredByRenderedBoundary(
+	pending: PendingPiCompactionMarker,
+	injection: PiInjectionResult | null,
+): boolean {
+	if (!injection || injection.contentionExhausted) return false;
+	const boundary = injection.renderedBoundary;
+	if (pending.endMessageId === boundary.endMessageId) return true;
+	return boundary.ordinal !== null && pending.ordinal <= boundary.ordinal;
+}
+
 async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	let executedWorkThisPass = false;
 	let historyWasConsumedThisPass = false;
@@ -3448,6 +3520,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	let emergency = false;
 	let autoReclaimDidMutateThisPass = false;
 	let suppressDeferredHistoryDrain = false;
+	let deferredMaterializationConsumedThisPass = false;
 	let casLost = false;
 	const deferredHistoryWasPendingAtPassStart =
 		deferredHistoryRefreshSessions.has(args.sessionId);
@@ -3520,6 +3593,15 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	const alreadyRanHeuristicsThisTurn =
 		currentTurnId !== null &&
 		lastHeuristicsTurnIdBySession.get(args.sessionId) === currentTurnId;
+	// Pi's primary process always registers ctx_reduce. Hidden/no-session child
+	// processes do not use this context handler; if a future path marks a session
+	// as subagent here, suppress visible tags and nudges so the prompt never points
+	// at a missing session-scoped tool.
+	const sessionMetaForAvailability = getOrCreateSessionMeta(
+		args.db,
+		args.sessionId,
+	);
+	const ctxReduceCallable = !sessionMetaForAvailability.isSubagent;
 	// Mid-turn-aware gate for consuming DEFERRED publication signals — mirrors
 	// OpenCode's canConsumeDeferredOnThisPass. `args.schedulerDecision` is ALREADY
 	// the mid-turn-adjusted decision (applyMidTurnDeferral downgrades execute→defer
@@ -3592,13 +3674,21 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 					getCompartments(args.db, args.sessionId),
 				).value
 			: false;
+	const historianRunning = inFlightHistorian.has(args.sessionId);
+	// Match OpenCode's compartment-running veto: a normal execute/deferred drain
+	// must wait while the historian is reading its raw snapshot, but unavoidable
+	// busts still drain immediately so they do not create a second cache bust later.
+	const bypassHistorianGate =
+		args.forceMaterialization === true || m0HardFoldThisPass;
+	const hasPendingMaterializeSignal = hasPendingMaterialization(args.sessionId);
 	// Pi sessions are primary-equivalent today. If Pi adds subagents on this
 	// transform path, subagents should bypass this once-per-turn guard like
 	// OpenCode does, because they do not share the primary agent's turn cache.
 	const shouldRunHeuristics =
 		args.heuristics !== undefined &&
+		(!historianRunning || bypassHistorianGate) &&
 		(args.forceMaterialization === true ||
-			hasPendingMaterialization(args.sessionId) ||
+			hasPendingMaterializeSignal ||
 			deferredMaterializeEligible ||
 			// A known m[0] hard fold busts the prefix regardless, so fold this
 			// pass's reductions into that unavoidable bust instead of waiting for a
@@ -3606,9 +3696,9 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			m0HardFoldThisPass ||
 			(args.schedulerDecision === "execute" && !alreadyRanHeuristicsThisTurn));
 
-	// 1. Tagging: assigns tag numbers + injects §N§ prefixes (unless the
-	// session is a subagent, in which case prefixes are skipped but DB-side
-	// tag IDs still get created so drops continue to work).
+	// 1. Tagging: assigns tag numbers + injects §N§ prefixes when ctx_reduce
+	// is callable. DB-side tag IDs still get created when prefixes are skipped
+	// so queued drops and automatic cleanup continue to work.
 	//
 	// Pi-only fallback-tag adoption: the newest (in-flight) message is tagged
 	// under an unstable pi-msg-* fallback id on the pass it is newest (its real
@@ -3645,7 +3735,6 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		);
 	}
 	const tTag = performance.now();
-	const ctxReduceCallable = !args.isSubagent;
 	const { targets } = tagTranscript(
 		args.sessionId,
 		transcript,
@@ -3695,6 +3784,9 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	// detection in `before_agent_start` also signals this set so a
 	// real prompt-content change forces materialization on the same
 	// turn the cache already busts.
+	// Normal drains wait while this session's historian is in flight; force
+	// materialization and m[0] hard folds are already cache-busting, so they bypass
+	// the historian gate and drain now.
 	//
 	// PEEK-then-drain-on-success pattern (Oracle audit Round 8 #6):
 	// the signal is only deleted AFTER applyPendingOperations succeeds.
@@ -3702,7 +3794,6 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	//
 	// Drops in the protected window are deferred (re-queued) so the
 	// agent's recent working context stays intact.
-	const hasPendingMaterializeSignal = hasPendingMaterialization(args.sessionId);
 	const deferredMaterializationWasPending = deferredMaterializationSessions.has(
 		args.sessionId,
 	);
@@ -3734,7 +3825,8 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	const deferredHistoryRefresh =
 		canConsumeDeferredLate && deferredHistoryRefreshWasPending;
 	const shouldApplyPendingOps =
-		baseShouldApplyPendingOps || deferredMaterialize;
+		(baseShouldApplyPendingOps || deferredMaterialize) &&
+		(!historianRunning || bypassHistorianGate);
 	if (shouldApplyPendingOps) {
 		const applyReason = hasPendingMaterializeSignal
 			? "explicit_flush"
@@ -3899,28 +3991,30 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	// transform.ts:793. Idempotent — `cavemanCompress(originalText, level)`
 	// is deterministic, so replay produces the exact text the original
 	// execute pass produced, regardless of how many times it runs.
-	try {
-		// P0 perf: caveman replay only acts on tags whose tag_number is in
-		// `targets`, so fetch just that slice instead of the whole session
-		// (~50k rows on long sessions).
-		const tags = getTagsByNumbers(args.db, args.sessionId, targetTagNumbers);
-		const replayed = replayCavemanCompression(
-			args.sessionId,
-			args.db,
-			targets,
-			tags,
-		);
-		if (replayed > 0) {
+	if (args.heuristics?.caveman?.enabled && !args.isSubagent) {
+		try {
+			// P0 perf: caveman replay only acts on tags whose tag_number is in
+			// `targets`, so fetch just that slice instead of the whole session
+			// (~50k rows on long sessions).
+			const tags = getTagsByNumbers(args.db, args.sessionId, targetTagNumbers);
+			const replayed = replayCavemanCompression(
+				args.sessionId,
+				args.db,
+				targets,
+				tags,
+			);
+			if (replayed > 0) {
+				sessionLog(
+					args.sessionId,
+					`caveman replay: ${replayed} tags re-compressed from source`,
+				);
+			}
+		} catch (err) {
 			sessionLog(
 				args.sessionId,
-				`caveman replay: ${replayed} tags re-compressed from source`,
+				`caveman replay failed (continuing): ${err instanceof Error ? err.message : String(err)}`,
 			);
 		}
-	} catch (err) {
-		sessionLog(
-			args.sessionId,
-			`caveman replay failed (continuing): ${err instanceof Error ? err.message : String(err)}`,
-		);
 	}
 
 	// 3d. Cleanup stages NOT applicable to Pi (intentionally omitted):
@@ -3986,6 +4080,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				args.messages,
 				{
 					protectedTags: args.protectedTags,
+					staleReduceStripEnabled: args.canUseEmptySentinels,
 					// Tiered emergency drop fires only at ≥85% AND when the
 					// ceiling is known. forceMaterialization already incorporates
 					// the ≥85% / emergency condition for Pi (primary-equivalent).
@@ -3998,7 +4093,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 									ceilingTokens: args.emergencyCeilingTokens,
 								}
 							: undefined,
-					caveman: args.heuristics.caveman,
+					caveman: args.isSubagent ? undefined : args.heuristics.caveman,
 				},
 				activeTags,
 				stableIdResolver,
@@ -4053,7 +4148,9 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	if (deferredMaterialize && pendingOpsAppliedThisPass) {
 		const fullPassSucceeded = shouldRunHeuristics ? heuristicsExecuted : true;
 		if (fullPassSucceeded) {
-			consumeDeferredMaterialization(args.sessionId);
+			deferredMaterializationConsumedThisPass = consumeDeferredMaterialization(
+				args.sessionId,
+			);
 		}
 	}
 
@@ -4276,7 +4373,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			// a HARD trigger. injectM0M1Pi now keeps cached m[0] and soft-refreshes m[1];
 			// HARD triggers (model/system/ttl/epoch/upgrade/mutation) still
 			// re-materialize inside mustMaterializePi when genuinely needed.
-			injectionResult = injectM0M1Pi(
+			injectionResult = injectM0M1PiForRun(
 				{
 					sessionId: args.sessionId,
 					projectIdentity: args.projectIdentity,
@@ -4370,6 +4467,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		(deferredHistoryWasPendingAtPassStart || hasPendingMaterializeSignal) &&
 		!suppressDeferredHistoryDrain &&
 		!casLost;
+	let preserveDeferredMaterializationForMarkerDrain = false;
 	if (deferredHistoryDrainEligible) {
 		try {
 			const pending = getPendingPiCompactionMarkerState(
@@ -4377,7 +4475,26 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				args.sessionId,
 			);
 			if (!pending) {
-				consumeDeferredHistoryRefresh(args.sessionId);
+				if (injectionResult?.contentionExhausted === true) {
+					suppressDeferredHistoryDrain = true;
+					preserveDeferredMaterializationForMarkerDrain = true;
+					sessionLog(
+						args.sessionId,
+						"Pi deferred-history drain skipped: m[0]/m[1] used a contention fallback; preserving deferred signals",
+					);
+				} else {
+					consumeDeferredHistoryRefresh(args.sessionId);
+				}
+			} else if (
+				!pendingPiMarkerCoveredByRenderedBoundary(pending, injectionResult)
+			) {
+				suppressDeferredHistoryDrain = true;
+				preserveDeferredMaterializationForMarkerDrain = true;
+				const boundary = injectionResult?.renderedBoundary;
+				sessionLog(
+					args.sessionId,
+					`Pi compaction-marker drain skipped: pending ordinal ${pending.ordinal} is newer than rendered boundary ${boundary?.ordinal ?? "<none>"} endMessageId=${boundary?.endMessageId ?? "<none>"}; preserving deferred signals`,
+				);
 			} else if (!args.appendCompaction || !args.readBranchEntries) {
 				suppressDeferredHistoryDrain = true;
 				sessionLog(
@@ -4421,6 +4538,12 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				`Pi compaction-marker drain failed (continuing): ${err instanceof Error ? err.message : String(err)}`,
 			);
 		}
+	}
+	if (
+		preserveDeferredMaterializationForMarkerDrain &&
+		deferredMaterializationConsumedThisPass
+	) {
+		signalPiDeferredMaterialization(args.sessionId);
 	}
 
 	if (executedWorkThisPass) {

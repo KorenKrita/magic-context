@@ -60,7 +60,13 @@ export interface RegisterCtxWrapupDeps {
 		[modelKey: string]: number | undefined;
 	};
 	runPiHistorianForWrapup?: typeof runPiHistorian;
+	resolveRuntimeDeps?: (ctx: { cwd: string }) => CtxWrapupRuntimeDeps;
 }
+
+export type CtxWrapupRuntimeDeps = Omit<
+	RegisterCtxWrapupDeps,
+	"resolveRuntimeDeps"
+>;
 
 const DEFAULT_MESSAGES_TO_KEEP = 20;
 const LEASE_WAIT_MS = 1_000;
@@ -105,8 +111,9 @@ export function registerCtxWrapupCommand(
 				});
 				return;
 			}
+			const currentDeps = deps.resolveRuntimeDeps?.(ctx) ?? deps;
 
-			const sessionMeta = getOrCreateSessionMeta(deps.db, sessionId);
+			const sessionMeta = getOrCreateSessionMeta(currentDeps.db, sessionId);
 			if (sessionMeta.isSubagent) {
 				sendCtxStatusMessage(pi, {
 					title: "/ctx-wrapup",
@@ -116,7 +123,7 @@ export function registerCtxWrapupCommand(
 				return;
 			}
 
-			if (!deps.historianModel) {
+			if (!currentDeps.historianModel) {
 				sendCtxStatusMessage(pi, {
 					title: "/ctx-wrapup",
 					text: "## Magic Wrapup\n\n/ctx-wrapup is unavailable because `historian.model` is not configured.",
@@ -135,18 +142,13 @@ export function registerCtxWrapupCommand(
 				return;
 			}
 
-			let result: string;
-			try {
-				result = await runPiWrapup(
-					pi,
-					deps,
-					ctx,
-					sessionId,
-					parsed.messagesToKeep,
-				);
-			} catch (err) {
-				result = `## Magic Wrapup — Failed\n\n${err instanceof Error ? err.message : String(err)}`;
-			}
+			const result = await runPiWrapup(
+				pi,
+				currentDeps,
+				ctx,
+				sessionId,
+				parsed.messagesToKeep,
+			);
 			sendCtxStatusMessage(pi, {
 				title: "/ctx-wrapup",
 				text: result,
@@ -171,9 +173,6 @@ export async function runPiWrapup(
 	}
 	if (isPiRecompInFlight(sessionId)) {
 		return "## Magic Wrapup — Skipped\n\nA recomp or upgrade is already running for this session. Wait for it to finish, then try `/ctx-wrapup` again.";
-	}
-	if (!deps.historianModel) {
-		return "## Magic Wrapup — Failed\n\n`historian.model` is not configured.";
 	}
 
 	const provider = { readMessages: () => readPiSessionMessages(ctx) };
@@ -262,7 +261,7 @@ export async function runPiWrapup(
 			} catch (err) {
 				// A missed renewal is safe because the wrapup marker has a five-minute TTL.
 				console.warn(
-					`[magic-context][pi] /ctx-wrapup marker renewal failed for ${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
+					`[magic-context][omp] /ctx-wrapup marker renewal failed for ${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
 				);
 			}
 		}, 60_000);
@@ -363,7 +362,7 @@ export async function runPiWrapup(
 					} catch (err) {
 						// A missed renewal is safe because the compartment lease has a five-minute TTL.
 						console.warn(
-							`[magic-context][pi] /ctx-wrapup compartment lease renewal failed for ${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
+							`[magic-context][omp] /ctx-wrapup compartment lease renewal failed for ${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
 						);
 					}
 				}, COMPARTMENT_LEASE_RENEWAL_MS);
@@ -375,8 +374,9 @@ export async function runPiWrapup(
 						directory: ctx.cwd,
 						provider,
 						runner: deps.runner,
-						historianModel: deps.historianModel,
+						historianModel: deps.historianModel as string,
 						fallbackModels: deps.historianFallbacks,
+						fallbackModelId: modelKey,
 						historianChunkTokens: deps.historianChunkTokens,
 						boundarySnapshot: plan.snapshot,
 						refreshBoundarySnapshot: () =>

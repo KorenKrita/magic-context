@@ -19,6 +19,7 @@ import { createCtxMemoryTool } from "./ctx-memory";
 import { createCtxNoteTool } from "./ctx-note";
 import { createCtxReduceTool } from "./ctx-reduce";
 import { createCtxSearchTool } from "./ctx-search";
+import { registerTodosCommand } from "./todo-view-pi";
 import { createTodowriteTool } from "./todowrite";
 
 export interface RegisterToolsOptions {
@@ -38,10 +39,14 @@ export interface RegisterToolsOptions {
 	/** Number of recent tags that ctx_reduce should treat as protected
 	 *  (deferred drops instead of immediate). Should match `magic_context.protected_tags`. */
 	protectedTags?: number;
+	/** Resolve protected-tag config from the current cwd at tool-call time. */
+	resolveProtectedTags?: (ctx: { cwd: string }) => number | undefined;
 	/** When true, ctx_note accepts smart notes (surface_condition) because
 	 *  the dreamer is configured to evaluate them. When false, smart-note
 	 *  writes are rejected to avoid stuck-pending state. */
 	dreamerEnabled?: boolean;
+	/** Resolve smart-note enablement from the current cwd at tool-call time. */
+	resolveDreamerEnabled?: (ctx: { cwd: string }) => boolean | undefined;
 	/** When false, omit ctx_memory from the registered surface. Sidekick only
 	 *  needs read-only ctx_search; dreamer and the main agent keep ctx_memory. */
 	memoryToolEnabled?: boolean;
@@ -51,17 +56,17 @@ export interface RegisterToolsOptions {
 	 *  child session, so ctx_note would write notes orphaned under the hidden
 	 *  child id and ctx_expand would expand the child's empty transcript. */
 	sessionScopedToolsDisabled?: boolean;
+	/** When false, omit Magic Context's Pi todowrite tool entirely. */
+	todowriteEnabled?: boolean;
+	/** Main Pi entry registers /todos; lean subagent entries keep commands off. */
+	todowriteCommandEnabled?: boolean;
 }
 
 export function registerMagicContextTools(
 	pi: ExtensionAPI,
 	opts: RegisterToolsOptions,
 ): void {
-	// OMP's TSchema (ArkSchema) is structurally different from the `typebox`
-	// package's TObject at the type level, but runtime-compatible. Cast to
-	// satisfy the constraint without rewriting every tool's parameter schema.
 	const register = (tool: unknown) => pi.registerTool(tool as any);
-
 	register(
 		createCtxSearchTool({
 			db: opts.db,
@@ -94,19 +99,25 @@ export function registerMagicContextTools(
 			createCtxNoteTool({
 				db: opts.db,
 				dreamerEnabled: opts.dreamerEnabled ?? false,
+				resolveDreamerEnabled: opts.resolveDreamerEnabled,
 			}),
 		);
 
 		register(createCtxExpandTool({ db: opts.db }));
 	}
 
-	// `todowrite` parity with OpenCode. Pi-coding-agent has no built-in
-	// task list tool, so without this the synthetic-todowrite injector
-	// would never have anything to surface. The tool just captures the
-	// `todos` arg and echoes a pretty-printed JSON ack; `message_end`
-	// in index.ts snapshots `params.todos` into `session_meta.last_todo_state`
-	// for downstream synthesis. See `tools/todowrite.ts` header for rationale.
-	register(createTodowriteTool());
+	if (opts.todowriteEnabled !== false) {
+		// `todowrite` parity with OpenCode. Pi-coding-agent has no built-in
+		// task list tool, so without this the synthetic-todowrite injector
+		// would never have anything to surface. The tool just captures the
+		// `todos` arg and echoes a pretty-printed JSON ack; `message_end`
+		// in index.ts snapshots `params.todos` into `session_meta.last_todo_state`
+		// for downstream synthesis. See `tools/todowrite.ts` header for rationale.
+		register(createTodowriteTool());
+		if (opts.todowriteCommandEnabled !== false) {
+			registerTodosCommand(pi);
+		}
+	}
 
 	// ctx_reduce is session-scoped just like ctx_note/ctx_expand: it resolves the
 	// CURRENT session id at call time. Omit it for `--no-session` children where
@@ -116,6 +127,7 @@ export function registerMagicContextTools(
 			createCtxReduceTool({
 				db: opts.db,
 				protectedTags: opts.protectedTags ?? 20,
+				resolveProtectedTags: opts.resolveProtectedTags,
 			}),
 		);
 	}
