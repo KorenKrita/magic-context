@@ -229,7 +229,7 @@ export interface Transcript {
      *   compaction marker injection).
      * - Test assertions confirming the right adapter ran.
      */
-    readonly harness: "opencode" | "pi";
+    readonly harness: "opencode" | "pi" | "omp";
 
     /**
      * Commit accumulated mutations to the underlying source array.
