@@ -96,7 +96,7 @@ irm https://raw.githubusercontent.com/cortexkit/magic-context/master/scripts/ins
 npx @cortexkit/magic-context@latest setup
 ```
 
-The wizard auto-detects which harnesses you have (OpenCode, Pi, or both), adds the plugin, disables built-in compaction, helps you pick models for the historian, dreamer, and sidekick, and resolves conflicts with other context-management plugins. Target a specific harness with `--harness opencode` or `--harness pi`.
+The wizard auto-detects which harnesses you have (OpenCode, Pi, OMP, or any combination), adds the plugin, disables built-in compaction, helps you pick models for the historian, dreamer, and sidekick, and resolves conflicts with other context-management plugins. Target a specific harness with `--harness opencode`, `--harness pi`, or `--harness omp`.
 
 > **Why disable built-in compaction?** Magic Context manages context itself. The host's compaction would interfere with its cache-aware deferred operations and double-compress.
 
@@ -110,6 +110,18 @@ The wizard auto-detects which harnesses you have (OpenCode, Pi, or both), adds t
 ```
 
 **Pi:** `npx @cortexkit/magic-context@latest setup --harness pi` (requires Pi `>= 0.74.0`). The Pi extension shares the same database as OpenCode; project memories and embeddings pool across both.
+
+**OMP (Oh My Pi):** install the OMP extension package, then restart OMP:
+
+```bash
+# From the plugins directory
+cd ~/.omp/plugins
+npm install @cortexkit/omp-magic-context
+# Or link the dev build:
+ln -s /path/to/magic-context/packages/omp-plugin node_modules/@cortexkit/omp-magic-context
+```
+
+OMP discovers the extension via `package.json` → `"omp": { "extensions": [...] }`. Requires `@oh-my-pi/pi-coding-agent >= 16.0`. The OMP extension shares the same SQLite database and config as OpenCode and Pi — project memories, embeddings, and dreamer state are visible across all three harnesses. Session-scoped data is attributed by harness (`"omp"`) so each harness's sessions stay distinct. See [`packages/omp-plugin/README.md`](./packages/omp-plugin/README.md) for OMP-specific details.
 
 **Troubleshooting:** `npx @cortexkit/magic-context@latest doctor` auto-detects your harnesses, checks for conflicts (compaction, OMO hooks, DCP), verifies the plugin and TUI sidebar, runs an integrity check on the database, and fixes what it can. Add `--issue` to file a ready-to-submit bug report.
 

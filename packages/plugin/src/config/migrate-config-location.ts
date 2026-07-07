@@ -170,7 +170,7 @@ export function resolveLegacyConfigSources(directory: string): {
     };
 }
 
-export type ConfigHarness = "opencode" | "pi";
+export type ConfigHarness = "opencode" | "pi" | "omp";
 
 /**
  * Legacy sources owned by ONE harness, most-specific first. Used by the loaders

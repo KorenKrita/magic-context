@@ -22,7 +22,7 @@ export interface LastAssistantModel {
 export interface ChildInvocationRecordInput {
     db: Database | null;
     parentSessionId: string;
-    harness: "opencode" | "pi";
+    harness: "opencode" | "pi" | "omp";
     subagent: SubagentKind;
     startedAt: number;
     endedAt?: number;
