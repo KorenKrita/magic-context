@@ -22,7 +22,6 @@
 
 import { createRequire } from "node:module";
 import { join, resolve } from "node:path";
-import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { isDreamerRunnable } from "@magic-context/core/config/agent-disable";
 import { migrateMagicContextConfigLocations } from "@magic-context/core/config/migrate-config-location";
 import type {
@@ -80,6 +79,7 @@ import { setKeepSubagents } from "@magic-context/core/shared/keep-subagents";
 import { log } from "@magic-context/core/shared/logger";
 import { isSaneLimit } from "@magic-context/core/shared/models-dev-cache";
 import { resolveFallbackChain } from "@magic-context/core/shared/resolve-fallbacks";
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
 import {
 	type PiSidekickConfig,
@@ -144,6 +144,7 @@ import {
 import { withTimeout } from "./timeout";
 import { registerMagicContextTools } from "./tools";
 import {
+	parseTodos,
 	registerTodoOverlay,
 	registerTodoStateLifecycle,
 	setTodoSnapshot,
@@ -199,7 +200,7 @@ type TodoOverlayUpdater = { update: (sessionId?: string) => void };
 
 type CompatiblePiTodoCapture = {
 	normalized: string;
-	todos: unknown[];
+	todos: Exclude<ReturnType<typeof parseTodos>, null>;
 };
 
 function getCompatiblePiTodoCapture(
@@ -208,7 +209,9 @@ function getCompatiblePiTodoCapture(
 	if (!Array.isArray(todos)) return null;
 	const normalized = normalizeTodoStateJson(todos);
 	if (normalized === null) return null;
-	return { normalized, todos };
+	const parsed = parseTodos(todos);
+	if (parsed === null) return null;
+	return { normalized, todos: parsed };
 }
 
 function applyCompatiblePiTodoCapture(args: {
@@ -1390,9 +1393,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			const skipSigs =
 				effectiveConfig.system_prompt_injection?.skip_signatures ?? [];
 			if (
-				skipSigs.some(
-					(sig) => sig.length > 0 && systemPromptText.includes(sig),
-				)
+				skipSigs.some((sig) => sig.length > 0 && systemPromptText.includes(sig))
 			) {
 				return;
 			}

@@ -67,7 +67,7 @@
     },
     "packages/omp-plugin": {
       "name": "@cortexkit/omp-magic-context",
-      "version": "0.30.7",
+      "version": "0.31.5",
       "dependencies": {
         "@huggingface/transformers": "^4.1.0",
         "@jitl/quickjs-singlefile-cjs-release-asyncify": "0.32.0",
