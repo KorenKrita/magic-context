@@ -1,8 +1,5 @@
-import type {
-	ExtensionAPI,
-	ExtensionContext,
-} from "@oh-my-pi/pi-coding-agent";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
+import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
 const STATUS_KEY = "magic-context";
 const RECENT_FAILURE_MS = 60_000;
@@ -58,7 +55,7 @@ export function registerStatusLine(
 	pi.on("session_shutdown", async (_event, ctx) => {
 		const sessionId = resolveSessionId(ctx);
 		if (sessionId) lastRenderedBySession.delete(sessionId);
-		ctx.ui.setStatus(STATUS_KEY, undefined);
+		ctx.ui.setWidget(STATUS_KEY, undefined);
 	});
 }
 
@@ -72,7 +69,7 @@ export function updateStatusLine(
 	const text = renderStatusText(ctx, deps.db, sessionId);
 	if (!force && lastRenderedBySession.get(sessionId) === text) return;
 	lastRenderedBySession.set(sessionId, text);
-	ctx.ui.setStatus(STATUS_KEY, text);
+	ctx.ui.setWidget(STATUS_KEY, [text], { placement: "belowEditor" });
 }
 
 function renderStatusText(
