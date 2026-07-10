@@ -29,10 +29,7 @@ export {
     unregisterProjectEmbedding,
 } from "../project-embedding-registry";
 
-const DEFAULT_EMBEDDING_CONFIG: EmbeddingConfig = {
-    provider: "local",
-    model: DEFAULT_LOCAL_EMBEDDING_MODEL,
-};
+const DEFAULT_EMBEDDING_CONFIG: EmbeddingConfig = { provider: "off" };
 
 let embeddingConfig: EmbeddingConfig = DEFAULT_EMBEDDING_CONFIG;
 let provider: EmbeddingProvider | null = null;
@@ -66,11 +63,15 @@ function getLoadUnembeddedMemoriesStatement(db: Database): PreparedStatement {
 }
 
 function resolveEmbeddingConfig(config?: EmbeddingConfig): EmbeddingConfig {
-    if (!config || config.provider === "local") {
+    if (!config) {
+        return { provider: "off" };
+    }
+
+    if (config.provider === "local") {
         return {
             provider: "local",
-            model: config?.model?.trim() || DEFAULT_LOCAL_EMBEDDING_MODEL,
-            ...(config?.max_input_tokens
+            model: config.model.trim() || DEFAULT_LOCAL_EMBEDDING_MODEL,
+            ...(config.max_input_tokens
                 ? {
                       max_input_tokens: normalizeCompartmentChunkMaxInputTokens(
                           config.max_input_tokens,

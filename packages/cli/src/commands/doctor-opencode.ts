@@ -357,9 +357,8 @@ async function runIssueFlow(): Promise<number> {
 // it sometimes fails to install (its native binary download is interrupted), and
 // the plugin's static `import "onnxruntime-node"` then throws on every embedding
 // (#128). Surface it here with the fix instead of leaving users with the cryptic
-// resolver error in the log. Shared by the explicit-`local` branch AND the
-// no-config / default-provider path (local is the default, so a missing config
-// still means local embeddings).
+// resolver error in the log. Used when the user explicitly selects `local`;
+// omitted embedding configuration now defaults to `off`.
 function checkLocalEmbeddingRuntimeForDoctor(): { issues: number; localRuntimeBroken?: boolean } {
     const runtime = checkLocalEmbeddingRuntime(getOpenCodePluginCacheRoots());
     if (isLocalEmbeddingRuntimeBroken(runtime)) {
@@ -374,10 +373,8 @@ async function checkEmbeddingConfig(
     magicContextConfigPath: string,
 ): Promise<{ issues: number; localRuntimeBroken?: boolean }> {
     if (!existsSync(magicContextConfigPath)) {
-        // No config → local provider defaults apply. Still verify the local
-        // runtime: local is the DEFAULT, so "no config" means local embeddings,
-        // and a broken onnxruntime-node would silently fail (#128/#6).
-        return checkLocalEmbeddingRuntimeForDoctor();
+        log.info("Embedding provider disabled — semantic memory search is off");
+        return { issues: 0 };
     }
 
     let rawText: string;
@@ -409,12 +406,12 @@ async function checkEmbeddingConfig(
     const embedding = parsedConfig?.embedding as Record<string, unknown> | undefined;
     const provider = embedding?.provider;
 
-    if (provider === "off") {
+    if (provider === undefined || provider === "off") {
         log.info("Embedding provider disabled — semantic memory search is off");
         return { issues: 0 };
     }
 
-    if (provider === undefined || provider === "local") {
+    if (provider === "local") {
         return checkLocalEmbeddingRuntimeForDoctor();
     }
 

@@ -218,9 +218,9 @@ const BaseEmbeddingConfigSchema = z
     .object({
         provider: z
             .enum(["local", "openai-compatible", "off"])
-            .default("local")
+            .default("off")
             .describe(
-                "Embedding provider. 'local' uses Xenova/all-MiniLM-L6-v2, 'openai-compatible' requires endpoint and model, 'off' disables embeddings.",
+                "Embedding provider. Defaults to 'off'. 'local' uses Xenova/all-MiniLM-L6-v2, 'openai-compatible' requires endpoint and model, 'off' disables embeddings.",
             ),
         model: z
             .string()
@@ -599,10 +599,9 @@ export const MagicContextConfigSchema = z
             .describe(
                 "SQLite connection tuning for Magic Context's own context.db. These are per-connection PRAGMAs applied at open; they do not change the schema or what is stored.",
             ),
-        embedding: EmbeddingConfigSchema.default({
-            provider: "local",
-            model: DEFAULT_LOCAL_EMBEDDING_MODEL,
-        }).describe("Embedding provider configuration"),
+        embedding: EmbeddingConfigSchema.default({ provider: "off" }).describe(
+            "Embedding provider configuration",
+        ),
         temporal_awareness: z
             .boolean()
             .default(true)

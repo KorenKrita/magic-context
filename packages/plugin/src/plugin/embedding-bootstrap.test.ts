@@ -44,7 +44,7 @@ describe("ensureProjectRegisteredFromOpenCodeDirectory", () => {
         // Read-legacy-on-conflict: the CortexKit base is absent but THIS harness's
         // legacy project config exists, so it is read and trusted — NOT treated as
         // an untrusted/observation load that would suppress registration. The real
-        // embedding identity is registered so the project is fully functional
+        // project identity is registered with the safe default-off embedding state
         // before the user consolidates.
         writeFileSync(
             join(projectDir, "magic-context.jsonc"),
@@ -56,7 +56,9 @@ describe("ensureProjectRegisteredFromOpenCodeDirectory", () => {
         await ensureProjectRegisteredFromOpenCodeDirectory(projectDir, db);
 
         const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
-        expect(snapshot?.enabled).toBe(true);
+        expect(snapshot?.enabled).toBe(false);
+        expect(snapshot?.provider).toBe("off");
+        expect(snapshot?.modelId).toBe("off");
         expect(snapshot?.runtimeFingerprint).not.toStartWith("observation:");
     });
 });

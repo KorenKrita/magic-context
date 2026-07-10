@@ -307,6 +307,13 @@ describe("loadPluginConfig — secret redaction", () => {
         // The custom message explains WHY, not just "too big".
         expect(combined).toContain("capped at 80% for cache safety");
     });
+
+    it("defaults omitted embedding configuration to off", () => {
+        const result = loadWithUserConfig(JSON.stringify({ enabled: true }));
+
+        expect(result.embedding).toEqual({ provider: "off" });
+    });
+
     it("keeps embedding destination fields from trusted user config", () => {
         const config = JSON.stringify({
             embedding: {
@@ -565,8 +572,7 @@ describe("loadPluginConfig — variable expansion scope", () => {
                 { MC_PROJECT_ENDPOINT: "http://project-env.test/v1" },
             );
 
-            expect(result.embedding.provider).toBe("local");
-            expect(result.embedding.model).toBe(`{file:${secretFile}}`);
+            expect(result.embedding.provider).toBe("off");
             const warnings = result.configWarnings?.join("\n") ?? "";
             expect(warnings).toContain("Project-level config no longer supports");
             expect(warnings).toContain("security reasons");

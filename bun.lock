@@ -69,7 +69,6 @@
       "name": "@cortexkit/omp-magic-context",
       "version": "0.31.5",
       "dependencies": {
-        "@huggingface/transformers": "^4.1.0",
         "@jitl/quickjs-singlefile-cjs-release-asyncify": "0.32.0",
         "ai-tokenizer": "^1.0.6",
         "comment-json": "^5.0.0",
@@ -95,7 +94,6 @@
       "name": "@cortexkit/pi-magic-context",
       "version": "0.31.0",
       "dependencies": {
-        "@huggingface/transformers": "^4.1.0",
         "@jitl/quickjs-singlefile-cjs-release-asyncify": "0.32.0",
         "ai-tokenizer": "^1.0.6",
         "comment-json": "^5.0.0",
@@ -121,7 +119,6 @@
       "name": "@cortexkit/opencode-magic-context",
       "version": "0.31.0",
       "dependencies": {
-        "@huggingface/transformers": "^4.1.0",
         "@jitl/quickjs-singlefile-cjs-release-asyncify": "0.32.0",
         "@opencode-ai/plugin": "^1.17.11",
         "@opencode-ai/sdk": "^1.17.11",

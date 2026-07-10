@@ -73,7 +73,7 @@ Both are merged through a Zod schema. Invalid fields fall back to defaults — b
     "model": "anthropic/claude-haiku-4-5"
   },
   "embedding": {
-    "provider": "local"
+    "provider": "off"
   }
 }
 ```

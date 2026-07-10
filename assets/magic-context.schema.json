@@ -1158,8 +1158,8 @@
       "type": "object",
       "properties": {
         "provider": {
-          "default": "local",
-          "description": "Embedding provider. 'local' uses Xenova/all-MiniLM-L6-v2, 'openai-compatible' requires endpoint and model, 'off' disables embeddings.",
+          "default": "off",
+          "description": "Embedding provider. Defaults to 'off'. 'local' uses Xenova/all-MiniLM-L6-v2, 'openai-compatible' requires endpoint and model, 'off' disables embeddings.",
           "type": "string",
           "enum": [
             "local",

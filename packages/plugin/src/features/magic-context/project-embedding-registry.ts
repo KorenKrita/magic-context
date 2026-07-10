@@ -175,11 +175,15 @@ let projectSweepInProgress = false;
 let testProviderFactory: ((config: EmbeddingConfig) => EmbeddingProvider | null) | null = null;
 
 function resolveEmbeddingConfig(config?: EmbeddingConfig): EmbeddingConfig {
-    if (!config || config.provider === "local") {
+    if (!config) {
+        return { provider: "off" };
+    }
+
+    if (config.provider === "local") {
         return {
             provider: "local",
-            model: config?.model?.trim() || DEFAULT_LOCAL_EMBEDDING_MODEL,
-            ...(config?.max_input_tokens
+            model: config.model.trim() || DEFAULT_LOCAL_EMBEDDING_MODEL,
+            ...(config.max_input_tokens
                 ? {
                       max_input_tokens: normalizeCompartmentChunkMaxInputTokens(
                           config.max_input_tokens,
@@ -322,7 +326,7 @@ function snapshotFor(
         provider:
             registration.observationMode || !providerIsOn
                 ? "off"
-                : (registration.config.provider ?? "local"),
+                : (registration.config.provider ?? "off"),
     };
 }
 

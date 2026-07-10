@@ -140,7 +140,7 @@ function parseArgs(): CLIArgs {
 async function loadEmbeddingConfig(configPath: string): Promise<PluginEmbeddingConfig> {
     if (!existsSync(configPath)) {
         console.warn(
-            `[baseline] magic-context config not found at ${configPath}; using provider defaults (local MiniLM-L6).`,
+            `[baseline] magic-context config not found at ${configPath}; using provider defaults (off).`,
         );
         return {};
     }
